@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/anthropics/claude-code-go/internal/logger"
 )
 
 // StreamReader reads SSE events from the API
@@ -90,6 +92,11 @@ func (s *StreamReader) parseEvent(data string) (*StreamChunk, error) {
 	var event StreamEvent
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
 		return nil, fmt.Errorf("failed to parse event: %w", err)
+	}
+
+	// Log stream chunk
+	if log := logger.GetLogger(); log != nil {
+		log.LogStreamChunk(event.Type, event)
 	}
 
 	switch event.Type {

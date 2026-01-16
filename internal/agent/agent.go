@@ -6,8 +6,13 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
+	"github.com/anthropics/claude-code-go/internal/agentregistry"
 	"github.com/anthropics/claude-code-go/internal/api"
+	"github.com/anthropics/claude-code-go/internal/compaction"
+	"github.com/anthropics/claude-code-go/internal/logger"
+	"github.com/anthropics/claude-code-go/internal/permission"
 	"github.com/anthropics/claude-code-go/internal/tools"
 )
 
@@ -21,6 +26,9 @@ const (
 	EventTypeThinking       EventType = "thinking"
 	EventTypeError          EventType = "error"
 	EventTypeConversationEnd EventType = "conversation_end"
+	EventTypeAgentSwitch    EventType = "agent_switch"
+	EventTypeCompaction     EventType = "compaction"
+	EventTypeTokenUsage     EventType = "token_usage"
 )
 
 // Event represents an event emitted during agent execution
@@ -33,6 +41,13 @@ type Event struct {
 	ToolResult string
 	IsError    bool
 	Error      error
+	AgentName  string // For agent switch events
+
+	// Token usage
+	TokenUsage *api.Usage
+
+	// Compaction info
+	CompactionInfo string
 }
 
 // EventHandler is a function that handles events
@@ -40,20 +55,43 @@ type EventHandler func(event Event)
 
 // Agent represents the main Claude agent
 type Agent struct {
-	client       *api.Client
-	registry     *tools.Registry
-	conversation *Conversation
-	eventHandler EventHandler
-	workDir      string
+	client        *api.Client
+	registry      *tools.Registry
+	agentRegistry *agentregistry.Registry
+	permEvaluator *permission.Evaluator
+	compactor     *compaction.Compactor
+	conversation  *Conversation
+	eventHandler  EventHandler
+	workDir       string
+	currentAgent  string // Current agent name (build, plan, explore)
+	sessionID     string // Session ID for output truncation
+
+	// Token tracking
+	totalInputTokens      int
+	totalOutputTokens     int
+	totalCacheReadTokens  int
+	totalCacheWriteTokens int
 }
 
 // NewAgent creates a new agent
-func NewAgent(client *api.Client, registry *tools.Registry, workDir string) *Agent {
+func NewAgent(client *api.Client, registry *tools.Registry, agentRegistry *agentregistry.Registry, workDir string) *Agent {
+	// Get build agent info for initial system prompt
+	buildAgent, _ := agentRegistry.Get("build")
+	systemPrompt := buildAgent.GetSystemPrompt(workDir)
+
+	// Generate session ID
+	sessionID := fmt.Sprintf("session-%d", time.Now().Unix())
+
 	return &Agent{
-		client:       client,
-		registry:     registry,
-		conversation: NewConversation(DefaultSystemPrompt(workDir)),
-		workDir:      workDir,
+		client:        client,
+		registry:      registry,
+		agentRegistry: agentRegistry,
+		permEvaluator: permission.NewEvaluator(),
+		compactor:     compaction.NewCompactor(client),
+		conversation:  NewConversation(systemPrompt),
+		workDir:       workDir,
+		currentAgent:  "build", // Start with build agent
+		sessionID:     sessionID,
 	}
 }
 
@@ -70,6 +108,54 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 // GetConversation returns the conversation
 func (a *Agent) GetConversation() *Conversation {
 	return a.conversation
+}
+
+// GetCurrentAgent returns the current agent name
+func (a *Agent) GetCurrentAgent() string {
+	return a.currentAgent
+}
+
+// GetTokenUsage returns the total token usage
+func (a *Agent) GetTokenUsage() (input, output, cacheRead, cacheWrite int) {
+	return a.totalInputTokens, a.totalOutputTokens, a.totalCacheReadTokens, a.totalCacheWriteTokens
+}
+
+// trackTokens tracks token usage from a response
+func (a *Agent) trackTokens(usage api.Usage) {
+	a.totalInputTokens += usage.InputTokens
+	a.totalOutputTokens += usage.OutputTokens
+	a.totalCacheReadTokens += usage.CacheReadInputTokens
+	a.totalCacheWriteTokens += usage.CacheCreationInputTokens
+
+	// Emit token usage event
+	a.emit(Event{
+		Type:       EventTypeTokenUsage,
+		TokenUsage: &usage,
+	})
+}
+
+// SwitchAgent switches to a different agent
+func (a *Agent) SwitchAgent(agentName string) error {
+	// Get new agent info
+	newAgent, err := a.agentRegistry.Get(agentName)
+	if err != nil {
+		return fmt.Errorf("failed to get agent %s: %w", agentName, err)
+	}
+
+	// Update current agent
+	a.currentAgent = agentName
+
+	// Update system prompt
+	systemPrompt := newAgent.GetSystemPrompt(a.workDir)
+	a.conversation.SetSystemMessage(systemPrompt)
+
+	// Emit agent switch event
+	a.emit(Event{
+		Type:      EventTypeAgentSwitch,
+		AgentName: agentName,
+	})
+
+	return nil
 }
 
 // emit emits an event to the handler
@@ -113,6 +199,13 @@ func (a *Agent) runLoop(ctx context.Context) error {
 
 		// Process stream and collect response
 		content, toolCalls, err := a.processStream(ctx, stream)
+
+		// Track token usage from stream response
+		streamResp := stream.GetResponse()
+		if streamResp != nil {
+			a.trackTokens(streamResp.Usage)
+		}
+
 		stream.Close()
 
 		if err != nil {
@@ -123,6 +216,16 @@ func (a *Agent) runLoop(ctx context.Context) error {
 		// Add assistant response to conversation
 		if len(content) > 0 {
 			a.conversation.AddAssistantMessage(content)
+		}
+
+		// Check if compaction is needed
+		if err := a.checkAndCompact(ctx); err != nil {
+			// Log error but continue
+			if log := logger.GetLogger(); log != nil {
+				log.LogError("compaction_error", err, map[string]interface{}{
+					"session_id": a.sessionID,
+				})
+			}
 		}
 
 		// If no tool calls, we're done
@@ -241,13 +344,58 @@ func (a *Agent) processStream(ctx context.Context, stream *api.StreamReader) ([]
 func (a *Agent) executeToolCalls(ctx context.Context, toolCalls []api.Content) ([]api.Content, error) {
 	var results []api.Content
 
+	// Get current agent permissions
+	agentInfo, err := a.agentRegistry.Get(a.currentAgent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current agent: %w", err)
+	}
+
 	for _, call := range toolCalls {
 		if call.Type != api.ContentTypeToolUse {
 			continue
 		}
 
+		// Log tool call
+		if log := logger.GetLogger(); log != nil {
+			var inputMap map[string]interface{}
+			json.Unmarshal(call.Input, &inputMap)
+			log.LogToolCall(call.Name, call.ID, inputMap)
+		}
+
+		// Check permissions before execution
+		var inputMap map[string]interface{}
+		json.Unmarshal(call.Input, &inputMap)
+
+		// Extract pattern from input for permission check
+		pattern := extractPattern(call.Name, inputMap)
+		action := a.permEvaluator.Evaluate(call.Name, pattern, agentInfo.Permission)
+
+		// Handle permission denial
+		if action == permission.ActionDeny {
+			output := fmt.Sprintf("Permission denied: agent '%s' is not allowed to use tool '%s' with pattern '%s'",
+				a.currentAgent, call.Name, pattern)
+
+			a.emit(Event{
+				Type:       EventTypeToolUseEnd,
+				ToolName:   call.Name,
+				ToolID:     call.ID,
+				ToolResult: output,
+				IsError:    true,
+			})
+
+			results = append(results, api.Content{
+				Type:      api.ContentTypeToolResult,
+				ToolUseID: call.ID,
+				Content:   output,
+				IsError:   true,
+			})
+			continue
+		}
+
 		// Execute the tool
+		startTime := time.Now()
 		result, err := a.registry.Execute(ctx, call.Name, call.Input)
+		duration := time.Since(startTime)
 
 		var output string
 		var isError bool
@@ -258,6 +406,14 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolCalls []api.Content) (
 		} else {
 			output = result.Output
 			isError = result.IsError
+		}
+
+		// Apply output truncation if needed
+		output = a.truncateOutput(output, call.Name, call.ID)
+
+		// Log tool result
+		if log := logger.GetLogger(); log != nil {
+			log.LogToolResult(call.Name, call.ID, output, isError, duration)
 		}
 
 		a.emit(Event{
@@ -277,6 +433,106 @@ func (a *Agent) executeToolCalls(ctx context.Context, toolCalls []api.Content) (
 	}
 
 	return results, nil
+}
+
+// extractPattern extracts the pattern from tool input for permission checking
+func extractPattern(toolName string, input map[string]interface{}) string {
+	switch toolName {
+	case "read", "write", "edit":
+		if path, ok := input["file_path"].(string); ok {
+			return path
+		}
+	case "bash":
+		if cmd, ok := input["command"].(string); ok {
+			return cmd
+		}
+	case "glob":
+		if pattern, ok := input["pattern"].(string); ok {
+			return pattern
+		}
+	case "grep":
+		if pattern, ok := input["pattern"].(string); ok {
+			return pattern
+		}
+	}
+	return "*"
+}
+
+// checkAndCompact checks if compaction is needed and performs it
+func (a *Agent) checkAndCompact(ctx context.Context) error {
+	// Calculate current token usage
+	usage := compaction.TokenUsage{
+		Input:     a.totalInputTokens,
+		Output:    a.totalOutputTokens,
+		CacheRead: a.totalCacheReadTokens,
+	}
+
+	limits := compaction.DefaultModelLimits()
+
+	// Check if we need compaction (80% threshold)
+	if !compaction.NeedsCompaction(usage, limits) {
+		return nil
+	}
+
+	// Emit compaction start event
+	a.emit(Event{
+		Type:           EventTypeCompaction,
+		CompactionInfo: "Starting conversation compaction...",
+	})
+
+	// Try pruning first (faster than full compaction)
+	messages := a.conversation.GetMessages()
+	if compaction.CanPrune(messages) {
+		pruneResult := compaction.Prune(messages)
+		if pruneResult.PrunedCount > 0 {
+			// Replace messages with pruned version
+			a.conversation.Clear()
+			for _, msg := range pruneResult.Messages {
+				a.conversation.AddMessage(msg)
+			}
+
+			info := fmt.Sprintf("Pruned %d tool results (%d chars)", pruneResult.PrunedCount, pruneResult.PrunedChars)
+			a.emit(Event{
+				Type:           EventTypeCompaction,
+				CompactionInfo: info,
+			})
+			return nil
+		}
+	}
+
+	// If pruning not enough, do full compaction
+	compactResult, err := a.compactor.Compact(ctx, compaction.CompactInput{
+		Messages:   messages,
+		Model:      a.client.GetModel(),
+		MaxTokens:  4000,
+		KeepRecent: 2,
+	})
+	if err != nil {
+		return fmt.Errorf("compaction failed: %w", err)
+	}
+
+	// Replace conversation with compacted version
+	a.conversation.Clear()
+	for _, msg := range compactResult.Messages {
+		a.conversation.AddMessage(msg)
+	}
+
+	info := fmt.Sprintf("Compacted %d messages into summary", compactResult.CompactedCount)
+	a.emit(Event{
+		Type:           EventTypeCompaction,
+		CompactionInfo: info,
+	})
+
+	return nil
+}
+
+// truncateOutput truncates tool output if needed
+func (a *Agent) truncateOutput(output string, toolName string, callID string) string {
+	result := compaction.TruncateOutput(output, a.sessionID, toolName, callID)
+	if result.Truncated {
+		return result.Content
+	}
+	return output
 }
 
 // DefaultSystemPrompt returns the default system prompt
@@ -303,6 +559,22 @@ Guidelines:
 4. Complete tasks thoroughly before moving on
 5. Use tools proactively to accomplish tasks
 6. When editing files, ensure the old_string is unique or use replace_all
+
+IMPORTANT - Long-Running Processes:
+For processes that run indefinitely (dev servers, watch tasks, daemons):
+- Set "run_in_background": true in Bash tool parameters, OR
+- Append & to the command (e.g., "npm run dev &")
+The process will run in background and return immediately with PID and log file path.
+
+Examples:
+  {"command": "npm run dev", "run_in_background": true}  // Background server
+  {"command": "npm run dev &"}                            // Alternative syntax
+  {"command": "npm install"}                              // Normal command
+
+Timeouts:
+- Default timeout: 15 seconds (not 2 minutes anymore!)
+- Max timeout: 2 minutes
+- Background commands: 5 seconds to start
 
 Remember to use the TodoWrite tool to track complex multi-step tasks.`, workDir)
 }

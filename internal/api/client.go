@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anthropics/claude-code-go/internal/logger"
+	"github.com/anthropics/claude-code-go/internal/retry"
 )
 
 const (
@@ -36,6 +39,7 @@ type Client struct {
 	authType   AuthType
 	baseURL    string
 	httpClient *http.Client
+	retrier    *retry.Retrier
 	model      string
 	maxTokens  int
 }
@@ -88,6 +92,7 @@ func NewClient(credential string, opts ...ClientOption) *Client {
 		httpClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
+		retrier: retry.NewRetrier(),
 		model:     DefaultModel,
 		maxTokens: DefaultMaxTokens,
 	}
@@ -138,8 +143,35 @@ func (c *Client) CreateMessage(ctx context.Context, req *MessagesRequest) (*Mess
 
 	c.setHeaders(httpReq)
 
-	resp, err := c.httpClient.Do(httpReq)
+	// Log request
+	if log := logger.GetLogger(); log != nil {
+		headers := make(map[string]string)
+		for k, v := range httpReq.Header {
+			if len(v) > 0 {
+				headers[k] = v[0]
+			}
+		}
+		var bodyMap map[string]interface{}
+		json.Unmarshal(body, &bodyMap)
+		log.LogAPIRequest("POST", httpReq.URL.String(), headers, bodyMap)
+	}
+
+	startTime := time.Now()
+
+	// Use retrier to handle retries
+	resp, err := c.retrier.Do(ctx, func() (*http.Response, error) {
+		return c.httpClient.Do(httpReq)
+	})
+
+	duration := time.Since(startTime)
+
 	if err != nil {
+		if log := logger.GetLogger(); log != nil {
+			log.LogError("http_request_failed", err, map[string]interface{}{
+				"url":      httpReq.URL.String(),
+				"duration": duration.String(),
+			})
+		}
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -148,8 +180,26 @@ func (c *Client) CreateMessage(ctx context.Context, req *MessagesRequest) (*Mess
 		return nil, c.handleErrorResponse(resp)
 	}
 
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Log response
+	if log := logger.GetLogger(); log != nil {
+		respHeaders := make(map[string]string)
+		for k, v := range resp.Header {
+			if len(v) > 0 {
+				respHeaders[k] = v[0]
+			}
+		}
+		var respBodyMap map[string]interface{}
+		json.Unmarshal(respBody, &respBodyMap)
+		log.LogAPIResponse(resp.StatusCode, respHeaders, respBodyMap, duration)
+	}
+
 	var result MessagesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
@@ -178,14 +228,54 @@ func (c *Client) StreamMessage(ctx context.Context, req *MessagesRequest) (*Stre
 
 	c.setHeaders(httpReq)
 
+	// Log request
+	if log := logger.GetLogger(); log != nil {
+		headers := make(map[string]string)
+		for k, v := range httpReq.Header {
+			if len(v) > 0 {
+				headers[k] = v[0]
+			}
+		}
+		var bodyMap map[string]interface{}
+		json.Unmarshal(body, &bodyMap)
+		log.LogAPIRequest("POST", httpReq.URL.String(), headers, bodyMap)
+	}
+
+	startTime := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
+		if log := logger.GetLogger(); log != nil {
+			log.LogError("http_request_failed", err, map[string]interface{}{
+				"url":      httpReq.URL.String(),
+				"duration": time.Since(startTime).String(),
+			})
+		}
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
+		if log := logger.GetLogger(); log != nil {
+			respHeaders := make(map[string]string)
+			for k, v := range resp.Header {
+				if len(v) > 0 {
+					respHeaders[k] = v[0]
+				}
+			}
+			log.LogAPIResponse(resp.StatusCode, respHeaders, "error response", time.Since(startTime))
+		}
 		return nil, c.handleErrorResponse(resp)
+	}
+
+	// Log that streaming started
+	if log := logger.GetLogger(); log != nil {
+		respHeaders := make(map[string]string)
+		for k, v := range resp.Header {
+			if len(v) > 0 {
+				respHeaders[k] = v[0]
+			}
+		}
+		log.LogAPIResponse(resp.StatusCode, respHeaders, "stream_started", time.Since(startTime))
 	}
 
 	return NewStreamReader(resp.Body), nil

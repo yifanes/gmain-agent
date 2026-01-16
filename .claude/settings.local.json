@@ -3,7 +3,12 @@
     "allow": [
       "Bash(go mod tidy:*)",
       "Bash(go build:*)",
-      "Bash(./claude:*)"
+      "Bash(./claude:*)",
+      "Bash(ls:*)",
+      "Bash(chmod:*)",
+      "Bash(~/bin/gmain-agent:*)",
+      "Bash(go run:*)",
+      "Bash(/tmp/gmain-agent-test:*)"
     ]
   }
 }

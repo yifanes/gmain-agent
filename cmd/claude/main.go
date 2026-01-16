@@ -12,14 +12,16 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/anthropics/claude-code-go/internal/agent"
+	"github.com/anthropics/claude-code-go/internal/agentregistry"
 	"github.com/anthropics/claude-code-go/internal/api"
 	"github.com/anthropics/claude-code-go/internal/config"
+	"github.com/anthropics/claude-code-go/internal/logger"
 	"github.com/anthropics/claude-code-go/internal/tools"
 	"github.com/anthropics/claude-code-go/internal/ui"
 )
 
 var (
-	version = "0.1.0"
+	version = "0.3.0"
 )
 
 func main() {
@@ -34,6 +36,8 @@ It can read, write, and edit files, execute commands, search code, and more.`,
 
 	rootCmd.Flags().StringP("model", "m", "", "Model to use (default: claude-sonnet-4-20250514)")
 	rootCmd.Flags().Bool("version", false, "Show version information")
+	rootCmd.Flags().Bool("enable-logging", false, "Enable detailed logging to /tmp")
+	rootCmd.Flags().Bool("pretty-log", false, "Enable pretty-printed JSON logs")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -63,6 +67,21 @@ func runMain(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Initialize logging if enabled
+	enableLogging, _ := cmd.Flags().GetBool("enable-logging")
+	prettyLog, _ := cmd.Flags().GetBool("pretty-log")
+	if enableLogging {
+		if err := logger.InitLogger("/tmp", prettyLog); err != nil {
+			return fmt.Errorf("failed to initialize logger: %w", err)
+		}
+		defer func() {
+			if log := logger.GetLogger(); log != nil {
+				log.Close()
+			}
+		}()
+		fmt.Println("Logging enabled. Logs will be written to /tmp/claude-agent-*.log")
+	}
+
 	// Get working directory
 	workDir, err := os.Getwd()
 	if err != nil {
@@ -86,6 +105,12 @@ func runMain(cmd *cobra.Command, args []string) error {
 		clientOpts = append(clientOpts, api.WithAuthType(api.AuthTypeBearer))
 	}
 	client := api.NewClient(credential, clientOpts...)
+
+	// Create agent registry and register built-in agents
+	agentRegistry := agentregistry.NewRegistry()
+	if err := agentregistry.RegisterBuiltinAgents(agentRegistry); err != nil {
+		return fmt.Errorf("failed to register built-in agents: %w", err)
+	}
 
 	// Create tool registry
 	registry := tools.NewRegistry()
@@ -122,8 +147,31 @@ func runMain(cmd *cobra.Command, args []string) error {
 	})
 	registry.Register(askTool)
 
-	// Create agent
-	a := agent.NewAgent(client, registry, workDir)
+	// Create agent with agent registry
+	a := agent.NewAgent(client, registry, agentRegistry, workDir)
+
+	// Register plan mode tools with agent switch callback
+	planEnterTool := tools.NewPlanEnterTool(workDir, func(toAgent string) error {
+		return a.SwitchAgent(toAgent)
+	})
+	registry.Register(planEnterTool)
+
+	planExitTool := tools.NewPlanExitTool(workDir, func(toAgent string) error {
+		return a.SwitchAgent(toAgent)
+	})
+	registry.Register(planExitTool)
+
+	// Create task executor for subagent execution
+	taskExecutor := &simpleTaskExecutor{
+		client:        client,
+		agentRegistry: agentRegistry,
+		toolRegistry:  registry,
+		workDir:       workDir,
+	}
+
+	// Register task tool (for subagent invocation)
+	taskTool := tools.NewTaskTool(agentRegistry, taskExecutor)
+	registry.Register(taskTool)
 
 	// Set up event handler
 	a.SetEventHandler(func(event agent.Event) {
@@ -143,6 +191,21 @@ func runMain(cmd *cobra.Command, args []string) error {
 
 		case agent.EventTypeConversationEnd:
 			terminal.EndAssistantResponse()
+
+		case agent.EventTypeAgentSwitch:
+			terminal.EndAssistantResponse()
+			terminal.PrintInfo(fmt.Sprintf("Switched to %s agent", event.AgentName))
+
+		case agent.EventTypeTokenUsage:
+			if event.TokenUsage != nil {
+				input, output, cacheRead, cacheWrite := a.GetTokenUsage()
+				terminal.PrintInfo(fmt.Sprintf("Tokens: Input=%d (+%d cache) Output=%d [Total: %d]",
+					input, cacheRead, output, input+cacheRead+output+cacheWrite))
+			}
+
+		case agent.EventTypeCompaction:
+			terminal.EndAssistantResponse()
+			terminal.PrintInfo(fmt.Sprintf("Context: %s", event.CompactionInfo))
 		}
 	})
 
@@ -248,4 +311,49 @@ func handleCommand(input string, terminal *ui.Terminal, a *agent.Agent) (bool, e
 	default:
 		return false, fmt.Errorf("unknown command: %s. Type /help for available commands", cmd)
 	}
+}
+
+// simpleTaskExecutor implements tools.TaskExecutor for subagent execution
+type simpleTaskExecutor struct {
+	client        *api.Client
+	agentRegistry *agentregistry.Registry
+	toolRegistry  *tools.Registry
+	workDir       string
+}
+
+func (e *simpleTaskExecutor) ExecuteAgent(ctx context.Context, agentName string, prompt string) (string, error) {
+	// Create a new agent instance for the subagent
+	subAgent := agent.NewAgent(e.client, e.toolRegistry, e.agentRegistry, e.workDir)
+
+	// Switch to the requested agent
+	if err := subAgent.SwitchAgent(agentName); err != nil {
+		return "", fmt.Errorf("failed to switch to agent %s: %w", agentName, err)
+	}
+
+	// Execute the prompt
+	if err := subAgent.Chat(ctx, prompt); err != nil {
+		return "", fmt.Errorf("agent execution failed: %w", err)
+	}
+
+	// Collect the response from the conversation
+	// Get the last assistant message
+	messages := subAgent.GetConversation().GetMessages()
+	if len(messages) == 0 {
+		return "", fmt.Errorf("no response from agent")
+	}
+
+	lastMsg := messages[len(messages)-1]
+	if lastMsg.Role != api.RoleAssistant {
+		return "", fmt.Errorf("unexpected last message role: %s", lastMsg.Role)
+	}
+
+	// Concatenate text content from the last message
+	var response strings.Builder
+	for _, content := range lastMsg.Content {
+		if content.Type == api.ContentTypeText {
+			response.WriteString(content.Text)
+		}
+	}
+
+	return response.String(), nil
 }

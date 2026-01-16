@@ -1,6 +1,9 @@
 package api
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Role represents the role of a message sender
 type Role string
@@ -20,6 +23,16 @@ const (
 	ContentTypeImage      ContentType = "image"
 )
 
+// ToolStatus represents the status of a tool execution
+type ToolStatus string
+
+const (
+	ToolStatusPending   ToolStatus = "pending"
+	ToolStatusRunning   ToolStatus = "running"
+	ToolStatusCompleted ToolStatus = "completed"
+	ToolStatusError     ToolStatus = "error"
+)
+
 // Content represents a single content block in a message
 type Content struct {
 	Type      ContentType     `json:"type"`
@@ -30,12 +43,28 @@ type Content struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+
+	// Compaction support (internal use only, not sent to API)
+	Pruned   bool      `json:"-"` // 是否已被修剪
+	PrunedAt time.Time `json:"-"` // 修剪时间
+
+	// Tool execution tracking (internal use only)
+	ToolStatus    ToolStatus `json:"-"` // 工具执行状态
+	ToolStartTime time.Time  `json:"-"` // 工具开始时间
+	ToolEndTime   time.Time  `json:"-"` // 工具结束时间
+	ToolError     string     `json:"-"` // 工具错误信息
 }
 
 // Message represents a conversation message
 type Message struct {
 	Role    Role      `json:"role"`
 	Content []Content `json:"content"`
+
+	// Message metadata (internal use only)
+	AgentName   string    `json:"-"` // 发送此消息的 Agent 名称
+	CreatedAt   time.Time `json:"-"` // 消息创建时间
+	TokensInput int       `json:"-"` // 输入 token 数
+	TokensOutput int      `json:"-"` // 输出 token 数
 }
 
 // NewTextMessage creates a new text message
@@ -97,6 +126,10 @@ type MessagesResponse struct {
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+
+	// Cache tokens (Anthropic)
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // StreamEvent represents an event in the streaming response
