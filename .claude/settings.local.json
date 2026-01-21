@@ -8,7 +8,11 @@
       "Bash(chmod:*)",
       "Bash(~/bin/gmain-agent:*)",
       "Bash(go run:*)",
-      "Bash(/tmp/gmain-agent-test:*)"
+      "Bash(/tmp/gmain-agent-test:*)",
+      "Bash(go get:*)",
+      "Bash(ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY:-test\" /tmp/gmain-agent-test \"hi\")",
+      "Bash(go vet:*)",
+      "Bash(go test:*)"
     ]
   }
 }

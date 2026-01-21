@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,7 +22,7 @@ import (
 )
 
 var (
-	version = "0.3.0"
+	version = "0.4.0"
 )
 
 func main() {
@@ -38,6 +39,7 @@ It can read, write, and edit files, execute commands, search code, and more.`,
 	rootCmd.Flags().Bool("version", false, "Show version information")
 	rootCmd.Flags().Bool("enable-logging", false, "Enable detailed logging to /tmp")
 	rootCmd.Flags().Bool("pretty-log", false, "Enable pretty-printed JSON logs")
+	rootCmd.Flags().Bool("simple", false, "Use simple terminal mode (no TUI)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -79,7 +81,6 @@ func runMain(cmd *cobra.Command, args []string) error {
 				log.Close()
 			}
 		}()
-		fmt.Println("Logging enabled. Logs will be written to /tmp/claude-agent-*.log")
 	}
 
 	// Get working directory
@@ -88,8 +89,13 @@ func runMain(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get working directory: %w", err)
 	}
 
-	// Create terminal UI
-	terminal := ui.NewTerminal()
+	// Check for simple mode
+	simpleMode, _ := cmd.Flags().GetBool("simple")
+
+	// If prompt provided as argument, always use simple mode
+	if len(args) > 0 {
+		simpleMode = true
+	}
 
 	// Create API client
 	credential, authType := cfg.GetAuthCredential()
@@ -100,7 +106,6 @@ func runMain(cmd *cobra.Command, args []string) error {
 	if cfg.BaseURL != "" {
 		clientOpts = append(clientOpts, api.WithBaseURL(cfg.BaseURL))
 	}
-	// Set auth type based on configuration
 	if authType == config.AuthTypeBearer {
 		clientOpts = append(clientOpts, api.WithAuthType(api.AuthTypeBearer))
 	}
@@ -125,6 +130,168 @@ func runMain(cmd *cobra.Command, args []string) error {
 	registry.Register(tools.NewGrepTool(workDir))
 	registry.Register(tools.NewWebFetchTool())
 	registry.Register(tools.NewTodoWriteTool(todoList))
+
+	if simpleMode {
+		return runSimpleMode(client, registry, agentRegistry, workDir, args)
+	}
+
+	return runTUIMode(client, registry, agentRegistry, workDir, cfg.Model)
+}
+
+// runTUIMode runs the application in TUI mode
+func runTUIMode(client *api.Client, registry *tools.Registry, agentRegistry *agentregistry.Registry, workDir, modelName string) error {
+	// Create TUI
+	tui := ui.NewSimpleTUI(version, "build", modelName, workDir)
+
+	// Create agent
+	a := agent.NewAgent(client, registry, agentRegistry, workDir)
+
+	// Get TUI adapter
+	adapter := tui.GetAdapter()
+
+	// Register ask user question tool
+	askTool := tools.NewAskUserQuestionTool(func(questions []tools.Question) (map[string]string, error) {
+		// In TUI mode, we'll use a simple approach for now
+		// TODO: Implement proper TUI-based question dialog
+		answers := make(map[string]string)
+		for _, q := range questions {
+			// Default to first option for now
+			if len(q.Options) > 0 {
+				answers[q.Header] = q.Options[0].Label
+			}
+		}
+		return answers, nil
+	})
+	registry.Register(askTool)
+
+	// Register plan mode tools
+	planEnterTool := tools.NewPlanEnterTool(workDir, func(toAgent string) error {
+		err := a.SwitchAgent(toAgent)
+		if err == nil {
+			adapter.OnAgentSwitch(toAgent)
+		}
+		return err
+	})
+	registry.Register(planEnterTool)
+
+	planExitTool := tools.NewPlanExitTool(workDir, func(toAgent string) error {
+		err := a.SwitchAgent(toAgent)
+		if err == nil {
+			adapter.OnAgentSwitch(toAgent)
+		}
+		return err
+	})
+	registry.Register(planExitTool)
+
+	// Create task executor
+	taskExecutor := &simpleTaskExecutor{
+		client:        client,
+		agentRegistry: agentRegistry,
+		toolRegistry:  registry,
+		workDir:       workDir,
+	}
+	taskTool := tools.NewTaskTool(agentRegistry, taskExecutor)
+	registry.Register(taskTool)
+
+	// Set up agent event handler
+	a.SetEventHandler(func(event agent.Event) {
+		switch event.Type {
+		case agent.EventTypeText:
+			adapter.OnText(event.Text)
+
+		case agent.EventTypeToolUseStart:
+			var inputStr string
+			if event.ToolInput != "" {
+				inputStr = event.ToolInput
+			}
+			adapter.OnToolStart(event.ToolName, event.ToolID, inputStr)
+
+		case agent.EventTypeToolUseEnd:
+			adapter.OnToolEnd(event.ToolName, event.ToolID, event.ToolResult, event.IsError)
+
+		case agent.EventTypeError:
+			adapter.OnError(event.Error)
+
+		case agent.EventTypeConversationEnd:
+			adapter.OnDone()
+
+		case agent.EventTypeAgentSwitch:
+			adapter.OnAgentSwitch(event.AgentName)
+
+		case agent.EventTypeTokenUsage:
+			if event.TokenUsage != nil {
+				input, output, cacheRead, cacheWrite := a.GetTokenUsage()
+				adapter.OnTokenUpdate(input, output, cacheRead, cacheWrite)
+			}
+
+		case agent.EventTypeCompaction:
+			adapter.OnCompaction(event.CompactionInfo)
+		}
+	})
+
+	// Set up message handler
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tui.SetMessageHandler(func(msg string) error {
+		// Handle commands
+		if strings.HasPrefix(msg, "/") {
+			return handleTUICommand(msg, a, adapter)
+		}
+		return a.Chat(ctx, msg)
+	})
+
+	// Run TUI
+	return tui.Run()
+}
+
+// handleTUICommand handles commands in TUI mode
+func handleTUICommand(input string, a *agent.Agent, adapter *ui.AgentEventAdapter) error {
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		return nil
+	}
+
+	cmd := strings.ToLower(parts[0])
+
+	switch cmd {
+	case "/help":
+		adapter.OnCompaction("Commands: /help, /clear, /exit, /model, /agent, /tokens")
+		return nil
+
+	case "/clear":
+		a.GetConversation().Clear()
+		adapter.OnCompaction("Conversation cleared")
+		return nil
+
+	case "/exit", "/quit":
+		os.Exit(0)
+		return nil
+
+	case "/model":
+		adapter.OnCompaction("Current model: " + "claude-sonnet-4-20250514")
+		return nil
+
+	case "/agent":
+		adapter.OnCompaction("Current agent: " + a.GetCurrentAgent())
+		return nil
+
+	case "/tokens":
+		input, output, cacheRead, cacheWrite := a.GetTokenUsage()
+		adapter.OnCompaction(fmt.Sprintf("Tokens: Input=%d Output=%d Cache=%d Total=%d",
+			input, output, cacheRead, input+output+cacheRead+cacheWrite))
+		return nil
+
+	default:
+		adapter.OnCompaction(fmt.Sprintf("Unknown command: %s. Type /help for available commands", cmd))
+		return nil
+	}
+}
+
+// runSimpleMode runs the application in simple terminal mode
+func runSimpleMode(client *api.Client, registry *tools.Registry, agentRegistry *agentregistry.Registry, workDir string, args []string) error {
+	// Create terminal UI
+	terminal := ui.NewTerminal()
 
 	// Create ask user question tool with handler
 	askTool := tools.NewAskUserQuestionTool(func(questions []tools.Question) (map[string]string, error) {
@@ -258,7 +425,7 @@ func runMain(cmd *cobra.Command, args []string) error {
 
 		// Handle commands
 		if strings.HasPrefix(input, "/") {
-			handled, err := handleCommand(input, terminal, a)
+			handled, err := handleSimpleCommand(input, terminal, a)
 			if err != nil {
 				terminal.PrintError(err)
 			}
@@ -277,7 +444,7 @@ func runMain(cmd *cobra.Command, args []string) error {
 	}
 }
 
-func handleCommand(input string, terminal *ui.Terminal, a *agent.Agent) (bool, error) {
+func handleSimpleCommand(input string, terminal *ui.Terminal, a *agent.Agent) (bool, error) {
 	parts := strings.Fields(input)
 	if len(parts) == 0 {
 		return false, nil
@@ -302,10 +469,20 @@ func handleCommand(input string, terminal *ui.Terminal, a *agent.Agent) (bool, e
 
 	case "/model":
 		if len(parts) < 2 {
-			terminal.PrintInfo("Current model: " + "claude-sonnet-4-20250514") // TODO: get from client
+			terminal.PrintInfo("Current model: " + "claude-sonnet-4-20250514")
 			return true, nil
 		}
 		terminal.PrintInfo("Model switching requires restart")
+		return true, nil
+
+	case "/agent":
+		terminal.PrintInfo("Current agent: " + a.GetCurrentAgent())
+		return true, nil
+
+	case "/tokens":
+		input, output, cacheRead, cacheWrite := a.GetTokenUsage()
+		terminal.PrintInfo(fmt.Sprintf("Tokens: Input=%d Output=%d Cache=%d Total=%d",
+			input, output, cacheRead, input+output+cacheRead+cacheWrite))
 		return true, nil
 
 	default:
@@ -336,7 +513,6 @@ func (e *simpleTaskExecutor) ExecuteAgent(ctx context.Context, agentName string,
 	}
 
 	// Collect the response from the conversation
-	// Get the last assistant message
 	messages := subAgent.GetConversation().GetMessages()
 	if len(messages) == 0 {
 		return "", fmt.Errorf("no response from agent")
@@ -356,4 +532,17 @@ func (e *simpleTaskExecutor) ExecuteAgent(ctx context.Context, agentName string,
 	}
 
 	return response.String(), nil
+}
+
+// formatToolInput formats tool input for display
+func formatToolInput(input string) string {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(input), &data); err != nil {
+		return input
+	}
+	formatted, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return input
+	}
+	return string(formatted)
 }
